@@ -4,11 +4,24 @@ const token = location.pathname.split("/").filter(Boolean)[1];
 const errorEl = document.getElementById("error");
 const publishBtn = document.getElementById("publish");
 
+// 轮询按发起次序编号：只接受最新一次发起的状态请求的响应，迟到的旧快照整份丢弃，
+// 不会用旧时间点的数据覆盖较新状态（例如旧轮询的 closed=false 覆盖新轮询的封存状态）
+let pollSeq = 0;
+// 封存一旦在本页确认（收到 closed=true 快照，或封存请求被服务端接受）即永久锁存：
+// 此后迟到的 closed=false 旧快照、合辑发布拒绝或任何网络失败都不得撤销封存提示、
+// 不得重新启用公布/合辑等写控件。服务端封存同样不可逆，此锁存只用于挡住响应交错
+let sealedClosed = false;
+// 最近一次渲染的主持状态：封存请求成功后立即据此切到只读界面，不必等下一次轮询
+let lastState = null;
+
 async function refresh() {
+  const seq = ++pollSeq;
   let s;
   try {
     const r = await fetch("/api/h/" + token);
     const data = await r.json();
+    // 期间已有更新的轮询发出：本响应无论成功或失败都一律作废，不触碰界面
+    if (seq !== pollSeq) return;
     if (!r.ok) {
       document.getElementById("content").hidden = true;
       const fatal = document.getElementById("fatal");
@@ -18,12 +31,20 @@ async function refresh() {
     }
     s = data;
   } catch {
-    return; // 网络抖动，下次轮询再试
+    return; // 网络抖动，下次轮询再试；已确认封存时界面保持封存只读
+  }
+  if (s.closed) {
+    sealedClosed = true;
+  } else if (sealedClosed) {
+    // 封存永久不可逆：即使次序正确的较新响应写着 closed=false（理论上不会发生），
+    // 或锁存后任何旧快照晚到，都按已封存渲染，绝不解除只读
+    s = Object.assign({}, s, { closed: true });
   }
   render(s);
 }
 
 function render(s) {
+  lastState = s;
   document.getElementById("published-banner").hidden = !s.published;
   document.getElementById("closed-banner").hidden = !s.closed;
   // 封存区仅公布后、未封存时出现；封存后一切主持写操作按钮禁用
@@ -241,12 +262,14 @@ document.getElementById("anthology-publish").addEventListener("click", async () 
       errorEl.textContent =
         (data.error || "发布失败") +
         (data.missing_consent ? "（未授权：" + data.missing_consent.join("、") + "）" : "");
-      btn.disabled = false;
+      // 发布等待期间轮询可能已显示封存；封存不可逆，拒绝响应不得重新启用发布
+      btn.disabled = !!sealedClosed;
       return;
     }
   } catch {
     errorEl.textContent = "网络错误，请重试";
-    btn.disabled = false;
+    // 已确认封存后网络失败同样不得启用发布；未封存时保留名单供重试
+    btn.disabled = !!sealedClosed;
     return;
   }
   refresh();
@@ -288,14 +311,26 @@ document.getElementById("close-session").addEventListener("click", async () => {
     const data = await r.json();
     if (!r.ok) {
       closeError.textContent = data.error || "封存失败，请刷新主持台后重试";
-      btn.disabled = false;
+      // 拒绝不代表未封存：若服务端显示会话已经封存（重复封存 409 等），立即刷新对齐；
+      // 若确实未封存（有未解决事项），按钮恢复可重试。封存锁存一旦置位不会被此处解除
+      if (data.error && data.error.indexOf("已经封存") !== -1) {
+        refresh();
+      } else {
+        btn.disabled = false;
+      }
       return;
     }
   } catch {
     closeError.textContent = "网络错误，请重试";
-    btn.disabled = false;
+    // 网络失败无法确认封存结果：若此前轮询已显示封存（锁存已置位），保持只读不恢复按钮；
+    // 否则允许重试
+    btn.disabled = !!sealedClosed;
     return;
   }
+  // 封存被服务端接受：立即永久锁存并按当前快照切到封存只读界面，不必等下一次轮询；
+  // 此后任何迟到的 closed=false 旧快照、发布拒绝或网络失败都不能解除它
+  sealedClosed = true;
+  if (lastState) render(Object.assign({}, lastState, { closed: true }));
   refresh();
 });
 
