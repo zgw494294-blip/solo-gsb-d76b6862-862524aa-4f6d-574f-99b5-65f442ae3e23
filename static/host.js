@@ -4,12 +4,26 @@ const token = location.pathname.split("/").filter(Boolean)[1];
 const errorEl = document.getElementById("error");
 const publishBtn = document.getElementById("publish");
 
+// 封存是服务端确认的一次性、不可撤销状态：页面一旦在任一响应中看到 closed=true
+// （轮询快照或封存操作成功），即永久锁存，此后迟到的旧快照（closed=false）、
+// 发布拒绝、网络失败都不得解除只读或撤销封存提示。
+let sealed = false;
+// 轮询序号：只采用最新一次轮询的响应，迟到的旧响应整份丢弃（不渲染），
+// 但新轮询照常更新授权状态、回执、举报、链接等会话信息。
+let pollSeq = 0;
+// 最近一次成功渲染的快照：封存操作成功而随后的刷新网络失败时，
+// 用它立即按封存状态重绘，不依赖下一次成功轮询。
+let lastState = null;
+
 async function refresh() {
+  const seq = ++pollSeq;
   let s;
   try {
     const r = await fetch("/api/h/" + token);
     const data = await r.json();
     if (!r.ok) {
+      // 迟到的旧失败响应也不得覆盖更新快照造成的界面
+      if (seq !== pollSeq) return;
       document.getElementById("content").hidden = true;
       const fatal = document.getElementById("fatal");
       fatal.hidden = false;
@@ -18,17 +32,25 @@ async function refresh() {
     }
     s = data;
   } catch {
-    return; // 网络抖动，下次轮询再试
+    return; // 网络抖动，下次轮询再试；封存状态已由 sealed 锁存，不会因此解除
   }
+  // 交错保护：期间已有更新的轮询发出或返回时，丢弃这份迟到的旧快照，
+  // 避免旧的 closed=false 把已确认的封存提示与只读状态撤销
+  if (seq !== pollSeq) return;
   render(s);
 }
 
 function render(s) {
+  lastState = s;
+  // 一旦任一快照显示已封存即永久锁存：本函数此后永远按封存只读渲染，
+  // 迟到的旧快照 closed=false 也不能撤销封存
+  if (s.closed) sealed = true;
+  const closed = sealed;
   document.getElementById("published-banner").hidden = !s.published;
-  document.getElementById("closed-banner").hidden = !s.closed;
+  document.getElementById("closed-banner").hidden = !closed;
   // 封存区仅公布后、未封存时出现；封存后一切主持写操作按钮禁用
-  document.getElementById("close-section").hidden = !s.published || !!s.closed;
-  publishBtn.disabled = !s.can_publish || !!s.closed;
+  document.getElementById("close-section").hidden = !s.published || closed;
+  publishBtn.disabled = !s.can_publish || closed;
 
   const pending = s.reviewers.filter((r) => !r.submitted).map((r) => r.name);
   const acked = s.reviewers.filter((r) => r.acknowledged).length;
@@ -64,7 +86,7 @@ function render(s) {
   }
 
   renderReports(s.published ? (s.reports || []) : []);
-  renderAnthology(s);
+  renderAnthology(s, closed);
 
   const linksBody = document.getElementById("links");
   linksBody.innerHTML = "";
@@ -90,7 +112,7 @@ function render(s) {
     removeBtn.textContent = "移除成员";
     removeBtn.dataset.name = l.name;
     // 公布后不可移除：按钮禁用；封存后换发同样停用
-    rotateBtn.disabled = !!s.closed;
+    rotateBtn.disabled = closed;
     removeBtn.disabled = !!s.published;
     tdAction.append(rotateBtn, removeBtn);
     tr.append(tdName, tdLink, tdAction);
@@ -157,7 +179,7 @@ const anthologySelection = new Set();
 // 最近一次渲染的名单顺序（即页面名单顺序）：发布时按此顺序提交勾选的姓名
 let anthologyMemberOrder = [];
 
-function renderAnthology(s) {
+function renderAnthology(s, closed) {
   const section = document.getElementById("anthology-section");
   section.hidden = !s.published;
   if (!s.published) return;
@@ -191,8 +213,8 @@ function renderAnthology(s) {
     cb.value = r.name;
     // 轮询重绘：按姓名恢复勾选/取消的结果
     cb.checked = anthologySelection.has(r.name);
-    // 封存后只读：禁用选择
-    cb.disabled = !!s.closed;
+    // 封存后只读：禁用选择（closed 已锁存，迟到旧快照不能恢复）
+    cb.disabled = closed;
     cb.addEventListener("change", () => {
       if (cb.checked) anthologySelection.add(r.name);
       else anthologySelection.delete(r.name);
@@ -206,15 +228,18 @@ function renderAnthology(s) {
     tr.append(tdPick, tdName, tdConsent);
     tbody.appendChild(tr);
   }
-  // 封存后禁用发布
-  document.getElementById("anthology-publish").disabled = !!s.closed;
+  // 封存后禁用发布（closed 已锁存，迟到旧快照不能恢复）
+  document.getElementById("anthology-publish").disabled = closed;
 }
 
 // 发布匿名合辑：按页面名单顺序提交点击时勾选的姓名；任一入选稿未授权则整次失败，
-// 失败后保留勾选，可调整名单或待授权后重试
+// 失败后保留勾选，可调整名单或待授权后重试。
+// 交错保护：等待响应期间轮询若已显示封存（或此前已确认封存），随后即使收到
+// 拒绝（含服务端 409 封存拒绝）或网络失败，也保持禁用、不解除只读——封存不可撤销。
 document.getElementById("anthology-publish").addEventListener("click", async () => {
   const errorEl = document.getElementById("anthology-error");
   errorEl.textContent = "";
+  if (sealed) return;
   const names = anthologyMemberOrder.filter((n) => anthologySelection.has(n));
   if (!names.length) {
     errorEl.textContent = "请至少选择一名成员。";
@@ -241,12 +266,13 @@ document.getElementById("anthology-publish").addEventListener("click", async () 
       errorEl.textContent =
         (data.error || "发布失败") +
         (data.missing_consent ? "（未授权：" + data.missing_consent.join("、") + "）" : "");
-      btn.disabled = false;
+      // 已确认封存（等待期间轮询显示封存等）则保持禁用：拒绝不得撤销封存
+      if (!sealed) btn.disabled = false;
       return;
     }
   } catch {
     errorEl.textContent = "网络错误，请重试";
-    btn.disabled = false;
+    if (!sealed) btn.disabled = false;
     return;
   }
   refresh();
@@ -296,6 +322,10 @@ document.getElementById("close-session").addEventListener("click", async () => {
     btn.disabled = false;
     return;
   }
+  // 封存已被服务端确认：立即锁存并按封存状态重绘，不等待随后的刷新
+  // （即使该刷新网络失败，封存提示与只读也已经生效；之后的 3 秒轮询继续更新信息）
+  sealed = true;
+  if (lastState) render(Object.assign({}, lastState, { closed: true }));
   refresh();
 });
 

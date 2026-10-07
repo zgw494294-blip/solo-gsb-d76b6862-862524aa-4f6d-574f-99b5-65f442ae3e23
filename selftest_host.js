@@ -1,7 +1,8 @@
 "use strict";
 /**
- * 主持页匿名合辑勾选的前端回归自测（不依赖浏览器与运行中的服务）：
- * 用最小 DOM 模拟在 Node 的 vm 中加载 static/host.js，验证 3 秒轮询不再清空勾选。
+ * 主持页匿名合辑勾选与封存只读的前端回归自测（不依赖浏览器与运行中的服务）：
+ * 用最小 DOM 模拟在 Node 的 vm 中加载 static/host.js，验证 3 秒轮询不再清空勾选，
+ * 以及封存确认后任何迟到响应都不能撤销只读。
  *
  * 覆盖：
  * - 重复轮询：勾选在多次轮询重绘后保留，且各人授权状态仍随轮询更新；
@@ -11,7 +12,15 @@
  *   由服务端整次 409 拒绝并显示原因，失败后保留勾选供调整重试；
  * - 空名单：提示且不发请求；
  * - 发布成功：按页面名单顺序提交勾选姓名，成功后显示公开链接并停止编辑；
- * - 只读转换：会话封存后勾选框与发布按钮均禁用，已发合辑只显示公开链接。
+ * - 只读转换：会话封存后勾选框与发布按钮均禁用，已发合辑只显示公开链接；
+ * - 交错一（迟到旧轮询）：较新轮询已返回 closed=true 后，迟到的 closed=false
+ *   旧响应被整份丢弃，不撤销封存提示、不恢复合辑控件；之后的新轮询仍更新
+ *   授权与会话信息；
+ * - 交错二（发布等待期间封存）：发布请求等待中轮询已显示封存，随后收到
+ *   409 拒绝或网络失败，发布按钮保持禁用，不解除只读；
+ * - 封存确认后的网络失败：封存 POST 成功即进入只读，随后的刷新网络失败
+ *   不撤销封存提示、不启用控件；
+ * - 未封存时的发布网络失败：显示原因、保留勾选与名单，重试成功。
  *
  * 运行：node selftest_host.js
  */
@@ -107,7 +116,9 @@ function hostState(overrides = {}) {
 }
 
 // 在模拟 DOM 中加载 host.js：env.state 为每次 GET 轮询返回的状态（可随时替换），
-// env.postResponse 为下一次 POST /anthology 的响应
+// env.postResponse 为下一次 POST /anthology 的响应；
+// 需要精确控制响应到达顺序（交错用例）时，可替换 env.handleGet / env.handlePost，
+// 或让 fetch 抛出网络错误（env.networkError / env.getError）。
 function createPage() {
   const elements = {};
   for (const id of ELEMENT_IDS) elements[id] = new El("div");
@@ -118,6 +129,12 @@ function createPage() {
     postResponse: null,
     confirmResult: true,
     poll: null,
+    // 置为 Error 实例时，下一次 fetch（GET 或 POST）直接 reject，模拟网络失败；
+    // 也可设为只接收 call 的函数按请求决定是否抛出
+    networkError: null,
+    // 默认 GET/POST 处理；交错用例可整体替换
+    handleGet: null,
+    handlePost: null,
   };
   const document = {
     getElementById: (id) => elements[id] || null,
@@ -133,9 +150,14 @@ function createPage() {
         body: opts && opts.body ? JSON.parse(opts.body) : undefined,
       };
       env.fetchCalls.push(call);
+      const netErr =
+        typeof env.networkError === "function" ? env.networkError(call) : env.networkError;
+      if (netErr) throw netErr;
       if (call.method === "GET") {
+        if (env.handleGet) return env.handleGet(call);
         return { ok: true, json: async () => env.state };
       }
+      if (env.handlePost) return env.handlePost(call);
       const resp = env.postResponse || { ok: false, body: { error: "未配置 POST 响应" } };
       return { ok: resp.ok, json: async () => resp.body };
     },
@@ -150,6 +172,15 @@ function createPage() {
   vm.createContext(sandbox);
   vm.runInContext(HOST_JS, sandbox, { filename: "host.js" });
   return env;
+}
+
+// 可控响应：返回 { promise, resolve(resp) }，fetch 挂起直到测试方放行
+function deferredResponse() {
+  const d = {};
+  d.promise = new Promise((resolve) => {
+    d.resolve = resolve;
+  });
+  return d;
 }
 
 // ---------------- 页面操作辅助 ----------------
@@ -203,6 +234,33 @@ async function clickPublish(env) {
 
 function posts(env) {
   return env.fetchCalls.filter((c) => c.method === "POST");
+}
+
+// 封存只读后主持台应有的界面：封存提示显示、封存区隐藏、合辑勾选框与发布按钮全部停用
+function assertClosed(env, msg) {
+  const prefix = msg ? msg + "：" : "";
+  assert.equal(env.elements["closed-banner"].hidden, false, prefix + "封存提示应保持显示");
+  assert.equal(env.elements["close-section"].hidden, true, prefix + "封存区应保持隐藏");
+  assert.equal(
+    env.elements["anthology-publish"].disabled,
+    true,
+    prefix + "合辑发布按钮应保持禁用"
+  );
+  const cbs = rows(env).map((tr) => tr.children[0].children[0]);
+  assert.ok(cbs.length > 0, prefix + "合辑名单应仍只读显示");
+  assert.ok(cbs.every((cb) => cb.disabled), prefix + "合辑勾选框应全部禁用");
+  const rotateBtns = env.elements["links"].children.map(
+    (tr) => tr.children[2].children[0]
+  );
+  assert.ok(
+    rotateBtns.every((b) => b.disabled),
+    prefix + "换发链接等写操作按钮应保持停用"
+  );
+}
+
+async function clickClose(env) {
+  env.elements["close-session"].dispatch("click");
+  await flush();
 }
 
 // ---------------- 用例 ----------------
@@ -343,6 +401,161 @@ test("会话封存后禁用选择与发布（只读转换）", async () => {
   assert.equal(
     env.elements["anthology-link"].textContent,
     "http://localhost:8000/a/readonly1"
+  );
+});
+
+test("交错一：较新轮询 closed=true 后，迟到的 closed=false 旧响应不解除只读", async () => {
+  const env = createPage();
+  await flush();
+  await setChecked(env, "甲", true);
+
+  // 第一次轮询挂起（旧请求）
+  const oldPoll = deferredResponse();
+  env.handleGet = () =>
+    oldPoll.promise.then((s) => ({ ok: true, json: async () => s }));
+  env.poll();
+  await flush();
+
+  // 第二次轮询先返回封存快照：页面立即进入只读
+  const closedState = hostState({ closed: true });
+  env.handleGet = () =>
+    Promise.resolve({ ok: true, json: async () => closedState });
+  env.poll();
+  await flush();
+  assertClosed(env, "较新轮询已显示封存");
+
+  // 迟到的第一次轮询此时才返回封存前的旧快照（closed=false）：必须被整份丢弃
+  oldPoll.resolve(hostState({ closed: false }));
+  await flush();
+  assertClosed(env, "迟到的 closed=false 旧响应不得解除只读");
+  assert.deepEqual(checkedNames(env), ["甲"], "旧响应不得改动勾选");
+
+  // 交错结束后的新轮询照常更新授权与会话信息（乙授权变为可见），只读不变
+  const s2 = hostState({ closed: true });
+  s2.reviewers[1].anthology_consent = true;
+  env.handleGet = null;
+  await poll(env, s2);
+  assert.equal(consentText(env, "乙"), "已授权", "新轮询仍须更新授权状态");
+  assertClosed(env, "新轮询后封存只读不变");
+});
+
+test("交错二：发布请求等待期间已封存，随后收到 409 拒绝不启用发布按钮", async () => {
+  const env = createPage();
+  await flush();
+  await setChecked(env, "甲", true);
+  await setChecked(env, "丙", true);
+
+  // 发布请求挂起等待
+  const postResp = deferredResponse();
+  env.handlePost = () =>
+    postResp.promise.then((resp) => ({ ok: resp.ok, json: async () => resp.body }));
+  await clickPublish(env);
+  assert.equal(posts(env).length, 1, "应已发出发布请求");
+  assert.equal(env.elements["anthology-publish"].disabled, true, "等待期间按钮禁用");
+
+  // 等待期间轮询显示会话已封存（主持人另一标签页封存/轮询先看到结果）
+  await poll(env, hostState({ closed: true }));
+  assertClosed(env, "等待期间看到封存即进入只读");
+
+  // 随后才收到服务端拒绝（409 封存拒绝）：不得重新启用发布、不解除只读
+  postResp.resolve({
+    ok: false,
+    body: { error: "会话已封存，只读，不能再写入" },
+  });
+  await flush();
+  assertClosed(env, "迟到的发布拒绝不得撤销封存");
+  assert.ok(
+    env.elements["anthology-error"].textContent.length > 0,
+    "拒绝原因照常显示"
+  );
+  assert.deepEqual(checkedNames(env), ["甲", "丙"], "勾选名单保留（只读）");
+
+  // 之后再点发布也不应发请求
+  await clickPublish(env);
+  assert.equal(posts(env).length, 1, "封存后点击发布不得再发请求");
+});
+
+test("交错二（网络失败）：发布等待期间已封存，随后网络失败也不解除只读", async () => {
+  const env = createPage();
+  await flush();
+  await setChecked(env, "甲", true);
+
+  const postResp = deferredResponse();
+  env.handlePost = () => postResp.promise;
+  await clickPublish(env);
+  assert.equal(posts(env).length, 1);
+
+  await poll(env, hostState({ closed: true }));
+  assertClosed(env, "等待期间看到封存即进入只读");
+
+  // 发布请求最终网络失败：封存提示与只读仍保持
+  postResp.resolve(Promise.reject(new Error("network down")));
+  await flush();
+  assertClosed(env, "封存后的网络失败不得解除只读");
+  assert.equal(posts(env).length, 1, "封存后不得因网络失败补发请求");
+});
+
+test("封存 POST 成功后随即刷新网络失败：仍立即进入封存只读，不撤销", async () => {
+  const env = createPage();
+  await flush();
+  await setChecked(env, "甲", true);
+
+  // /close 成功；其成功后触发的刷新 GET 网络失败
+  env.postResponse = { ok: true, body: { ok: true, closed: true } };
+  env.networkError = (call) =>
+    call.url === "/api/h/hosttok" && call.method === "GET"
+      ? new Error("network down")
+      : null;
+  await clickClose(env);
+  await flush();
+
+  assertClosed(env, "封存确认后即使刷新网络失败也保持封存只读");
+  assert.deepEqual(checkedNames(env), ["甲"], "封存后勾选名单只读保留");
+
+  // 网络恢复后的 3 秒轮询继续更新授权和会话信息
+  env.networkError = null;
+  const s = hostState({ closed: true });
+  s.reviewers[1].anthology_consent = true;
+  await poll(env, s);
+  assert.equal(consentText(env, "乙"), "已授权", "轮询仍须更新授权状态");
+  assertClosed(env, "网络恢复后封存只读不变");
+});
+
+test("未封存时发布网络失败：显示原因并保留名单，恢复后重试成功", async () => {
+  const env = createPage();
+  await flush();
+  await setChecked(env, "甲", true);
+  await setChecked(env, "丙", true);
+
+  // 第一次发布：网络失败（会话仍未封存）
+  env.networkError = (call) =>
+    call.url.endsWith("/anthology") ? new Error("network down") : null;
+  await clickPublish(env);
+  assert.equal(posts(env).length, 1);
+  assert.equal(
+    env.elements["anthology-error"].textContent,
+    "网络错误，请重试",
+    "网络失败应显示原因"
+  );
+  assert.equal(
+    env.elements["anthology-publish"].disabled,
+    false,
+    "未封存失败后按钮应恢复可用"
+  );
+  assert.deepEqual(checkedNames(env), ["甲", "丙"], "失败后保留勾选名单供调整重试");
+
+  // 网络恢复：无需重新勾选，按原名单重试成功，显示公开链接并停止编辑
+  env.networkError = null;
+  env.postResponse = { ok: true, body: { ok: true, url: "/a/retry1" } };
+  env.state = hostState({ anthology_url: "/a/retry1" });
+  await clickPublish(env);
+  assert.equal(posts(env).length, 2, "应重试发出第二次发布请求");
+  assert.deepEqual(posts(env)[1].body, { names: ["甲", "丙"] }, "重试仍提交原勾选");
+  assert.equal(env.elements["anthology-form"].hidden, true, "成功后停止编辑");
+  assert.equal(env.elements["anthology-done"].hidden, false);
+  assert.equal(
+    env.elements["anthology-link"].textContent,
+    "http://localhost:8000/a/retry1"
   );
 });
 
